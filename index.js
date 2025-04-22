@@ -50,6 +50,28 @@ app.get("/status", (req, res) => {
 io.on("connection", (socket) => {
   console.log(`Client connected: ${socket.id}`);
 
+  // Ping handler for connectivity testing
+  socket.on("ping", (timestamp, callback) => {
+    // Reply with original timestamp for latency calculation
+    if (typeof callback === "function") {
+      callback(timestamp);
+    }
+  });
+
+  // Check if a session exists
+  socket.on("checkSession", (data, callback) => {
+    const { sessionId } = data;
+
+    if (!sessionId) {
+      callback({ exists: false, error: "No session ID provided" });
+      return;
+    }
+
+    console.log(`Checking if session ${sessionId} exists`);
+    const exists = sessions.has(sessionId);
+    callback({ exists });
+  });
+
   // Host creates a new session
   socket.on("createSession", (callback) => {
     const sessionId = uuidv4().substring(0, 6).toUpperCase();
@@ -62,40 +84,51 @@ io.on("connection", (socket) => {
         host: [],
         client: [],
       },
+      createdAt: Date.now(),
     });
 
     socket.join(sessionId);
     console.log(`Host created session: ${sessionId}`);
 
-    // Set a timeout to clean up unused sessions
+    // Set a timeout to clean up unused sessions (increased for Windows clients)
     setTimeout(() => {
       const session = sessions.get(sessionId);
       if (session && !session.clientId) {
         console.log(`Session ${sessionId} timed out without client joining`);
         cleanupSession(sessionId);
       }
-    }, 10 * 60 * 1000); // 10 minutes
+    }, 15 * 60 * 1000); // 15 minutes (extended time for Windows clients)
 
     // Return the session ID to the host
     callback({ sessionId });
   });
 
   // Client joins an existing session
-  socket.on("joinSession", (data, callback) => {
+  socket.on("joinSession", async (data, callback) => {
     const { sessionId } = data;
 
+    if (!sessionId) {
+      callback({ error: "No session ID provided" });
+      return;
+    }
+
     if (!sessions.has(sessionId)) {
-      return callback({ error: "Session not found" });
+      console.log(`Attempted to join non-existent session: ${sessionId}`);
+      callback({ error: "Session not found" });
+      return;
     }
 
     const session = sessions.get(sessionId);
 
     if (session.clientId) {
-      return callback({ error: "Session is full" });
+      console.log(`Attempted to join full session: ${sessionId}`);
+      callback({ error: "Session is full" });
+      return;
     }
 
     // Update session with client info
     session.clientId = socket.id;
+    session.clientJoinedAt = Date.now();
     socket.join(sessionId);
     console.log(`Client joined session: ${sessionId}`);
 
@@ -107,29 +140,45 @@ io.on("connection", (socket) => {
 
     // Send stored offer if available
     if (session.offer) {
+      console.log(`Sending stored offer to client in session: ${sessionId}`);
       socket.emit("offer", session.offer);
     }
 
     // Send any stored ICE candidates from host
-    session.iceCandidates.host.forEach((candidate) => {
-      socket.emit("iceCandidate", {
-        from: "host",
-        candidate,
+    if (session.iceCandidates.host.length > 0) {
+      console.log(
+        `Sending ${session.iceCandidates.host.length} stored ICE candidates to client`
+      );
+      session.iceCandidates.host.forEach((candidate) => {
+        socket.emit("iceCandidate", {
+          from: "host",
+          candidate,
+        });
       });
-    });
+    }
   });
 
   // Exchange SDP offers and answers
   socket.on("offer", (data) => {
     const { sessionId, offer } = data;
 
-    if (!sessions.has(sessionId)) return;
+    if (!sessionId || !offer) {
+      console.log("Received invalid offer data");
+      return;
+    }
+
+    if (!sessions.has(sessionId)) {
+      console.log(`Received offer for non-existent session: ${sessionId}`);
+      return;
+    }
 
     const session = sessions.get(sessionId);
+    console.log(`Received offer for session: ${sessionId}`);
     session.offer = offer;
 
     // Forward offer to client if connected
     if (session.clientId) {
+      console.log(`Forwarding offer to client in session: ${sessionId}`);
       io.to(session.clientId).emit("offer", offer);
     }
   });
@@ -137,9 +186,18 @@ io.on("connection", (socket) => {
   socket.on("answer", (data) => {
     const { sessionId, answer } = data;
 
-    if (!sessions.has(sessionId)) return;
+    if (!sessionId || !answer) {
+      console.log("Received invalid answer data");
+      return;
+    }
+
+    if (!sessions.has(sessionId)) {
+      console.log(`Received answer for non-existent session: ${sessionId}`);
+      return;
+    }
 
     const session = sessions.get(sessionId);
+    console.log(`Received answer for session: ${sessionId}`);
 
     // Forward answer to host
     io.to(session.hostId).emit("answer", answer);
@@ -149,10 +207,23 @@ io.on("connection", (socket) => {
   socket.on("iceCandidate", (data) => {
     const { sessionId, candidate, isHost } = data;
 
-    if (!sessions.has(sessionId)) return;
+    if (!sessionId || !candidate) {
+      console.log("Received invalid ICE candidate data");
+      return;
+    }
+
+    if (!sessions.has(sessionId)) {
+      console.log(
+        `Received ICE candidate for non-existent session: ${sessionId}`
+      );
+      return;
+    }
 
     const session = sessions.get(sessionId);
     const role = isHost ? "host" : "client";
+    console.log(
+      `Received ICE candidate from ${role} for session: ${sessionId}`
+    );
 
     // Store candidate
     session.iceCandidates[role].push(candidate);
@@ -180,13 +251,20 @@ io.on("connection", (socket) => {
       if (session.hostId === socket.id) {
         // Host disconnected, notify client
         if (session.clientId) {
+          console.log(
+            `Host disconnected from session: ${sessionId}, notifying client`
+          );
           io.to(session.clientId).emit("hostDisconnected");
         }
         cleanupSession(sessionId);
       } else if (session.clientId === socket.id) {
         // Client disconnected, notify host
+        console.log(
+          `Client disconnected from session: ${sessionId}, notifying host`
+        );
         io.to(session.hostId).emit("clientDisconnected");
         session.clientId = null;
+        session.iceCandidates.client = [];
       }
     });
   });
